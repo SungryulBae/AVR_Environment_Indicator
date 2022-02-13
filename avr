@@ -1,0 +1,716 @@
+/*******************************************************
+Project : 
+Version : 
+Date    : 2021-12-24
+Author  : 
+Company : 
+Comments: 
+
+
+Chip type               : ATmega128A
+Program type            : Application
+AVR Core Clock frequency: 11.059200 MHz
+Memory model            : Small
+External RAM size       : 0
+Data Stack size         : 1024
+*******************************************************/
+
+//#include <io.h>
+#include <delay.h>
+#include <stdio.h>
+#include "mydef_.h"      
+#include "lcd.h"
+
+// Declare your global variables here
+#define _BV(bit) (1<<(bit))
+
+//i2c
+#define I2C_HTU21D_ADDR 0x40
+#define TRIGGER_TEMP_MEASURE  0xE3
+#define TRIGGER_HUMD_MEASURE  0xE5
+
+//mode
+#define  _start  0
+#define  _error  1
+#define  _temp   0xE
+#define  _humid  0xD
+#define  _dust   0xB
+#define  _cir    0x7
+
+
+// LCD
+u08 LCD_mode = 0;
+u08 str_degree[3] = {' ',0xDF,'C'};
+u08 LCD_cir_flag = 0;
+u08 ERROR_flag = 0;
+
+
+// timer0
+volatile u08 temp_cnt = 0;
+volatile u08 humid_cnt = 0;
+volatile u08 dust_cnt = 0;
+volatile u08 error_cnt = 0;
+volatile u08 cir_cnt = 0;
+
+double old_data;
+
+
+
+
+
+// dust
+int dust_avg = 0;
+double fvol_sum = 0;
+
+
+// i2c func
+void I2C_init(void);
+void I2C_start(void);
+void I2C_transmit(u08 data);
+u08 I2C_receive_ACK(void);
+u08 I2C_receive_NACK(void);
+void I2C_stop(void);
+
+// LCD
+void LCD_Display(double num);
+void lcd_print_data_rest(u08* data, u08 n_bytes);
+u32 HTU21D (u32 data_type);
+
+//BUZZER, LED
+void beep1(void);
+void beep3(void);
+void led_off(void);
+
+
+//
+void ADC_init(u08 channel);
+void read_ADC(void);
+
+
+
+
+
+// Voltage Reference: AREF pin
+#define ADC_VREF_TYPE ((0<<REFS1) | (0<<REFS0) | (0<<ADLAR))
+
+
+
+
+void main(void)
+{
+  // local variables
+  u08 old_key,new_key;
+  
+  
+
+  
+  //u08 str_sw3[] = "DUST  : ";
+ // u08 str_sw4[] = "ALL     ";
+
+  //u08 str_dt3[] = "data 3  ";
+  //u08 str_dt4[] = "data 4  ";
+    
+
+  //-----------------------------------------  
+  // IO PORT SETTING            
+  DDRA = 0x00;
+  PORTA = 0x00; //LCD DATA PORT
+  
+  // Function: Bit7=In Bit6=In Bit5=Out Bit4=In Bit3=In Bit2=In Bit1=In Bit0=In 
+  DDRB=(0<<DDB7) | (0<<DDB6) | (1<<DDB5) | (0<<DDB4) | (0<<DDB3) | (0<<DDB2) | (0<<DDB1) | (0<<DDB0);
+  PORTB=0x0F; //PORTB.3~0 PULL UP ON
+  
+  DDRC=0xFF;
+  PORTC=0x00;
+  
+  DDRD=0x00;
+  PORTD=0x00;  
+
+  DDRE= 0x00;
+  PORTE=0x00;  
+  
+  DDRF= 0x00;
+  PORTF=0x00;
+  
+  DDRG =0xFF;
+  PORTG=0x00; // BUZZER
+  
+  //-----------------------------------------
+  // Timer/Counter 0 init (센서값 요구 및 LCD 표시용)
+  
+  // 클럭 시작 -> TCCR0 = 0x07 (1024분주)
+  // 클럭 시작시 Clock value: 10.800 kHz
+  // 11.0592MHz/1024 = 10.800 kHz
+  // Timer Period: 256/10.8k = 23.704msec 
+  // TCNT0가 1 증가시 23.7msec 경과 
+     
+  TCCR0 = 0x07;
+  TCNT0 = 0x00;
+  OCR0 = 0x00;   
+  
+  TIMSK |= (1<<TOIE0); // 오버플로 인터럽트 허용
+
+  // Timer/Counter 1 initialization(PWM 발생 및 ADC0 read)    
+  
+  // Clock source: System Clock
+  // Clock value: 1382.400 kHz
+  // Mode: Fast PWM top=ICR1
+  // OC1A output: Inverted PWM
+  // OC1B output: Disconnected
+  // OC1C output: Disconnected
+  // Noise Canceler: Off
+  // Input Capture on Falling Edge
+  // Timer Period: 10 ms
+  // Output Pulse(s):
+  // OC1A Period: 10 ms Width: 9.6802 ms
+  // OC1B Period: 10 ms Width: 9.72 ms --> not pwm out
+  // Timer1 Overflow Interrupt: Off
+  // Input Capture Interrupt: Off
+  // Compare A Match Interrupt: Off
+  // Compare B Match Interrupt: On
+  // Compare C Match Interrupt: Off  
+  TCCR1A=(1<<COM1A1) | (1<<COM1A0) | (0<<COM1B1) | (0<<COM1B0) | (0<<COM1C1) | (0<<COM1C0) | (1<<WGM11) | (0<<WGM10);
+  TCCR1B=(0<<ICNC1) | (0<<ICES1) | (1<<WGM13) | (1<<WGM12) | (0<<CS12) | (1<<CS11) | (0<<CS10);
+  TCNT1H=0x00;
+  TCNT1L=0x00;
+  ICR1H=0x35;
+  ICR1L=0xFF;
+  
+  OCR1AH=0x01;
+  OCR1AL=0xBA;
+  OCR1BH=0x01;
+  OCR1BL=0x83;
+  
+  TIMSK |= (1<<OCIE1B); // 비교일치 B 인터럽트 허용
+
+  // Timer/Counter 2 initialization
+  // Clock source: System Clock
+  // Clock value: 10.800 kHz
+  // Mode: Normal top=0xFF
+  // OC2 output: Disconnected
+  // Timer Period: 23.704 ms
+  TCCR2=(0<<WGM20) | (0<<COM21) | (0<<COM20) | (0<<WGM21) | (1<<CS22) | (0<<CS21) | (1<<CS20);
+  TCNT2=0x00;
+  OCR2=0x00;
+  
+  TIMSK |= (1<<TOIE2); // 오버플로 인터럽트 허용
+
+
+  
+  // ADC initialization
+  // ADC Clock frequency: 172.800 kHz
+  // ADC Voltage Reference: AREF pin
+  ADC_init(0);
+  
+  // Globally enable interrupts
+  #asm("sei")   // SREG = 0x80;
+  
+  I2C_init();
+  
+  // LCD initial setting
+  lcd_init();   
+  lcd_clear(); 
+  lcd_home();
+   
+  lcd_control_write(0x80);
+  lcd_print_data("MdBy:BAE",8);     
+  lcd_control_write(0xC0);		
+  lcd_print_data("SUNGRYUL",8);     
+  delay_ms(1000); 
+           
+  lcd_control_write(0x80);
+  lcd_print_data("AIR QUAL",8);     
+  lcd_control_write(0xC0);		
+  lcd_print_data("ITY Info",8);     
+  delay_ms(1500);
+  
+  lcd_control_write(0x80);
+  lcd_print_data("Press An",8);
+  lcd_control_write(0xC0);
+  lcd_print_data("y Button",8);                   
+  //beep3();
+
+             
+  while (1)
+  {
+    new_key = KEY_IN & KEY_MASK;
+    if(new_key!=old_key)
+    {                      
+      switch(new_key)
+      {
+        case TEMP:
+          led_off();
+          LCD_cir_flag = 0;          
+          LCD_mode = _temp;          
+          LED1 = ON; 
+          beep1();                          
+          break;
+        case HUMID: 
+          led_off();      
+          LCD_cir_flag = 0;
+          LCD_mode = _humid;                    
+          LED2 = ON;       
+          beep1();
+          break;
+        case DUST:
+          led_off();   
+          LCD_cir_flag = 0;
+          LCD_mode = _dust;
+          LED3 = ON;                   
+          beep1();
+          break;
+        case CIR:
+          led_off(); 
+          LCD_cir_flag = 1;       
+          LCD_mode = _cir;           
+          beep1();
+          break;
+      }     
+      
+      ERROR_flag = 0; 
+    }
+    old_key = new_key;  
+    delay_ms(5);
+    
+    //if (ERROR_flag == 0 && LCD_mode == _error)
+    //{
+    //  LCD_mode = old_key;
+    //}
+    if (ERROR_flag == 1)
+    {
+      LCD_mode = _error;  
+      LED4 = ON; 
+    }
+
+  }
+}
+
+u32 HTU21D (u32 data_type)
+{
+  u32 data_msb = 0;
+  u32 data_lsb = 0;
+  u32 checksum = 0;
+  u32 recieve_data = 0;
+
+  
+  //start ---------------------------------------------
+  I2C_start();  
+  if((TWSR & 0xF8) != 0x08) // start code 전송완료 실패시
+  { 
+    ERROR_flag = 1;
+    LCD_mode = _error;
+    I2C_stop();
+    delay_ms(5);
+    return 0;
+  }
+  //set SLA+W -----------------------------------------
+  I2C_transmit(I2C_HTU21D_ADDR<<1); // i2c addr + write (0x80)
+  if((TWSR & 0xF8) != 0x18) // SLA+W 전송완료 및 ACK 신호 수신 완료 실패시
+  {
+    ERROR_flag = 1;
+    LCD_mode = _error;
+    I2C_stop();
+    delay_ms(5);
+    return 0;
+  }
+  //HOLD MASTER COMUNICATION command set --------------
+  I2C_transmit(data_type);
+  if((TWSR & 0xF8) != 0x28) // (송신모드) 데이터 바이트 전송완료 및 ACK 신호 수신 완료 실패시
+  {
+    ERROR_flag = 1;
+    LCD_mode = _error;
+    I2C_stop();
+    delay_ms(5);
+    return 0;
+  }
+  //Restart condition send ------------------------------
+  I2C_start();
+  if((TWSR & 0xF8) != 0x10) // Repeated START 코드 전송 완료 실패시
+  {
+    ERROR_flag = 1;
+    LCD_mode = _error;
+    I2C_stop();
+    delay_ms(5);
+    return 0;
+  }
+  //set SLA+R ------------------------------------------
+  I2C_transmit((I2C_HTU21D_ADDR<<1)+ 1); // i2c addr + read (0x81)
+  if((TWSR & 0xF8) != 0x40) // (수신모드) SLA+R 전송완료 및 ACK 신호 수신 완료 실패시
+  {
+    ERROR_flag = 1;
+    LCD_mode = _error;
+    I2C_stop();
+    delay_ms(5);
+    return 0;
+  }
+  // save data(MSB) ------------------------------------------------
+  data_msb = I2C_receive_ACK();
+  if((TWSR & 0xF8) != 0x50) // (수신모드) 데이터 바이트 수신완료 및 ACK 신호 반송 완료 실패시
+  {
+    ERROR_flag = 1;
+    LCD_mode = _error;
+    I2C_stop();
+    delay_ms(5);
+    return 0;
+  } 
+  // save data(LSB) ------------------------------------------------
+  data_lsb = I2C_receive_ACK();
+  if((TWSR & 0xF8) != 0x50) // (수신모드) 데이터 바이트 수신완료 및 ACK 신호 반송 완료 실패시
+  {
+    ERROR_flag = 1;
+    LCD_mode = _error;
+    I2C_stop();
+    delay_ms(5);
+    return 0;
+  }  
+  // save data(Checksum)
+  checksum = I2C_receive_NACK();   
+  if((TWSR & 0xF8) != 0x58) // (수신모드) 데이터 바이트 수신완료 및 NACK 신호 반송 완료 실패시
+  {
+    ERROR_flag = 1;
+    LCD_mode = _error;
+    I2C_stop();
+    delay_ms(5);
+    return 0;
+  }  
+  // stop I2C  
+  I2C_stop();     
+  
+  delay_ms(5); 
+  
+  // make data   
+  recieve_data |= (data_msb << 8);
+  recieve_data |= data_lsb;  
+  
+  recieve_data &= 0xFFFFFFFC;
+  ERROR_flag = 0;
+  
+  return recieve_data;
+} 
+
+//----------------- i2c Function -----------------------
+
+void I2C_init(void)
+{
+  DDRD |= (1<<I2C_SCL); // output
+  DDRD |= (1<<I2C_SDA); // output
+  
+  TWBR = 32;
+  TWSR = 0;                   
+}
+
+void I2C_start(void)
+{
+  // twi interrupt flag clear, twi start, twi enable
+  TWCR = _BV(TWINT) | _BV(TWSTA) | _BV(TWEN);  //0xA4
+  
+  // TWINT가 0에서 1로 변경시 while 탈출
+  while ( !(TWCR & (1<<TWINT)) ); // wait for start to complete
+
+}
+
+void I2C_transmit(u08 data)
+{
+  TWDR = data;
+  
+  // twi interrupt flag clear, twi start, twi enable ACK
+  TWCR = _BV(TWINT) | _BV(TWEN) | _BV(TWEA);  //0xC4
+  
+  while ( !(TWCR & (1<<TWINT)) ); // wait for transmit to complete
+}
+
+u08 I2C_receive_ACK(void)
+{ 
+  // twi interrupt flag clear, twi start, twi enable ACK
+  TWCR = _BV(TWINT) | _BV(TWEN) | _BV(TWEA);  //0xC4
+  
+  while ( !(TWCR & (1<<TWINT)) ); // wait for receive_ACK to complete
+  return TWDR;
+}
+u08 I2C_receive_NACK(void)
+{ 
+  // twi interrupt flag clear, twi start
+  TWCR = _BV(TWINT) | _BV(TWEN);  //0x84
+  
+  while ( !(TWCR & (1<<TWINT)) ); // wait for receive_NACK to complete
+  return TWDR;
+}
+
+void I2C_stop(void)
+{
+  // twi interrupt flag clear, twi stop, twi enable
+  TWCR = _BV(TWINT) | _BV(TWSTO) | _BV(TWEN);
+}
+
+//-------------------LCD------------------------------------------------------
+
+void LCD_Display(double num)
+{
+  double num_orig = num;
+  s16 inum, int_data, point_data;
+  char data_buffer[16];        
+       
+  if (num < 0) // if temp < 0
+  {
+    num = num * (-1);   
+  }
+    
+  inum = (int)(10*num+0.5);
+  int_data = inum / 10;   // 정수
+  point_data = inum % 10; // 소수
+    
+  // 모두 버퍼를 5자리로 변경
+   
+  if (int_data/100 != 0)
+  {
+    sprintf(data_buffer, "%d.%d", int_data, point_data);
+  }
+  else if (int_data/10 != 0)
+  {
+    sprintf(data_buffer, " %d.%d", int_data, point_data);
+  }
+  else
+  {
+    sprintf(data_buffer, "  %d.%d", int_data, point_data);
+  }
+    
+
+  if(LCD_mode == _temp)
+  {
+    lcd_control_write(0x80);
+    lcd_print_data("Temp : ",7);
+    if (num_orig<0)
+    {   
+      lcd_print_data("-",1);
+    }
+    else
+    {
+      lcd_print_data(" ",1);
+    }
+    lcd_control_write(0xC0);
+    lcd_print_data(data_buffer,5);     
+    lcd_print_data(str_degree,3); 
+  }
+
+  else if(LCD_mode == _humid)
+  {
+    lcd_control_write(0x80);
+    lcd_print_data("Humid:  ",8);
+    lcd_control_write(0xC0);
+    lcd_print_data(data_buffer,5);
+    lcd_print_data("  %",3);
+  }
+  else if(LCD_mode == _dust)
+  {
+    lcd_control_write(0x80);
+    lcd_print_data("Dust: ",6);
+    lcd_print_data(data_buffer,2);
+    lcd_control_write(0xC0);
+    lcd_print_data_rest(data_buffer,5);
+    lcd_print_data("ug/m3",5);
+  }
+  
+}
+
+void lcd_print_data_rest(u08* data, u08 n_bytes)
+{
+    u08 i;
+
+    for(i=2; i < n_bytes; i++)
+    {
+        lcd_data_write(data[i]);
+    }
+}
+
+
+
+
+
+// LCD Update Timer
+interrupt [TIM0_OVF] void timer0_ovf_isr(void)
+{
+  double data;
+  //tim0_cnt++;  
+  
+  if (LCD_mode == _temp)
+  { 
+    temp_cnt++;
+    
+    if (temp_cnt >= 20) // Update every 0.47 seconds 
+    {
+      data = HTU21D(TRIGGER_TEMP_MEASURE);
+      if(data != 0)
+      {
+          data = -46.85 + 175.72 * (((double)data)/65536.0);
+          LCD_Display(data);
+      } 
+      temp_cnt = 0; 
+    }          
+  }
+  else if (LCD_mode == _humid)
+  { 
+    humid_cnt++;
+    
+    if (humid_cnt >= 20) 
+    {
+      data = HTU21D(TRIGGER_HUMD_MEASURE);
+      if (data != 0)
+      {
+          data = -6 + 125 * (((double)data)/65536.0); 
+          LCD_Display(data);          
+      }  
+      humid_cnt = 0; 
+    }          
+  }
+  else if (LCD_mode == _dust)
+  { 
+    dust_cnt++;
+    
+    if (dust_cnt >= 20) 
+    {
+      LCD_Display(old_data);
+
+      dust_cnt = 0; 
+    }          
+  }
+  else if (LCD_mode == _cir)
+  { 
+    LCD_cir_flag = 1;
+  }
+  else if (LCD_mode == _error)
+  {   
+    error_cnt++;   
+    if (error_cnt == 15) 
+    { 
+      lcd_clear();
+      lcd_control_write(0x80);
+      lcd_print_data("Sensor  ",8);
+      lcd_control_write(0xC0);
+      lcd_print_data("Error !!",8);      
+    }
+    else if (error_cnt == 45)
+    {
+      lcd_clear();
+      error_cnt = 0;
+    }   
+  }  
+
+}
+
+
+interrupt [TIM2_OVF] void timer2_ovf_isr(void)
+{
+  if (LCD_cir_flag == 1)
+  { 
+    cir_cnt++;
+    
+    if (cir_cnt == 1)
+    {                       
+      LCD_mode = _temp;
+      LED1 =ON;
+    }
+    else if (cir_cnt == 80)
+    { 
+      LCD_mode = _humid;
+      LED2 =ON;
+    }
+    else if (cir_cnt == 160)
+    {  
+      LCD_mode = _dust;
+      LED3 =ON;    
+    } 
+    else if (cir_cnt >= 240)
+    {
+      led_off();
+      cir_cnt = 0;
+    }    
+  }
+}
+
+
+//----------------------adc
+
+// Timer1 output compare B interrupt service routine
+interrupt [TIM1_COMPB] void timer1_compb_isr(void)
+{
+  read_ADC(); 
+}
+
+void ADC_init(u08 channel)
+{
+  ADMUX = 0x00; // 외부 AREF 핀 입력을 기준전압으로
+  // Delay needed for the stabilization of the ADC input voltage
+  delay_us(10);
+  
+  //분주비 설정
+  // 11.0592M/64 = 172.8kHz (ADC clock 50~200k recomended) 
+  ADCSRA |= 0x06;
+  ADCSRA |= (1<<ADEN); // ADC enable
+  //ADCSRA |= (1<<ADFR); // free running mode
+  
+  ADMUX |= ((ADMUX & 0xE0) | channel); // choose channel
+  ADCSRA |= (1<<ADSC); // ADC start
+}
+
+void read_ADC(void)
+{
+   u32 ad_val;
+   double fvol, fdust;
+   
+   
+   ADCSRA = 0b11000110; // ADC enable,start,64분주
+   
+   while(!(ADCSRA & (1<<ADIF))); // 변환 종료 대기
+                                  
+   dust_avg += 1;   
+   ad_val = (int)ADCL + ((int)ADCH << 8); 
+   fvol = (double)ad_val*(5.0/1024.0);    
+   fvol_sum += fvol;
+   
+   if (dust_avg >= 50)  //50번 세고 평균
+   {
+     fvol_sum /= 50.0;
+     fdust = (fvol_sum - 0.29)/0.005;  
+     
+     //fdust = old_data*0.8 + fdust * 0.2;
+     old_data = fdust;
+     
+     dust_avg = 0;
+     fvol_sum = 0;      
+   } 
+}
+
+
+
+//----------- buzzer------------------
+
+void beep1(void)
+{
+  BUZ_RLY = BUZZER_ON; 
+  delay_ms(100);
+  BUZ_RLY = BUZZER_OFF;       
+}
+
+void beep3(void)
+{
+  BUZ_RLY = BUZZER_ON; 
+  delay_ms(100);
+  BUZ_RLY = BUZZER_OFF;
+  delay_ms(100);
+  BUZ_RLY = BUZZER_ON; 
+  delay_ms(100);
+  BUZ_RLY = BUZZER_OFF;
+  delay_ms(100);  
+  BUZ_RLY = BUZZER_ON; 
+  delay_ms(100);
+  BUZ_RLY = BUZZER_OFF;         
+}
+
+//----------- led ---------------
+void led_off(void)
+{
+  LED1 = OFF;
+  LED2 = OFF;
+  LED3 = OFF;
+  LED4 = OFF;
+}
